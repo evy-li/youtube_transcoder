@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# cleanup
+# Safely remove leftover preview FIFOs created by run.sh and provide options
+# to inspect/kill ffplay processes. Default is --dry-run which only shows
+# what would be removed.
+
+set -euo pipefail
+
+# Default: perform cleanup (remove FIFOs and kill ffplay). Use --dry-run to preview.
+DRY_RUN=0
+KILL_FFPLAY=1
+FORCE=0
+
+usage() {
+  cat <<USAGE
+Usage: $0 [--dry-run] [--force|-y] [--no-kill] [--kill-ffplay]
+
+Options:
+  --dry-run      Show what would be removed (do not delete or kill)
+  --force, -y    Actually remove matching FIFO files and kill without prompts
+  --no-kill      Do not kill ffplay processes (only remove FIFOs)
+  --kill-ffplay  Explicitly enable killing ffplay (redundant; this is the default)
+  -h, --help     Show this help
+
+This script only removes files matching /tmp/yt_preview_fifo.* and does
+not remove other files. Use --force/-y to actually delete and kill.
+USAGE
+}
+
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force|-y) DRY_RUN=0; FORCE=1; shift ;;
+    --no-kill) KILL_FFPLAY=0; shift ;;
+    --kill-ffplay) KILL_FFPLAY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1"; usage; exit 2 ;;
+  esac
+done
+
+PREVIEW_GLOB='/tmp/yt_preview_fifo.*'
+
+# List matching files
+matches=( $PREVIEW_GLOB )
+# If glob doesn't match, bash will keep the literal pattern; handle that
+if [[ ${#matches[@]} -eq 1 && "${matches[0]}" == "$PREVIEW_GLOB" ]]; then
+  matches=()
+fi
+
+if [[ ${#matches[@]} -eq 0 ]]; then
+  echo "No preview FIFO files found matching $PREVIEW_GLOB"
+else
+  echo "Found ${#matches[@]} preview FIFO file(s):"
+  for f in "${matches[@]}"; do
+    echo "  $f"
+  done
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo
+    echo "Dry-run mode: no files will be removed. Rerun with --force to delete."
+  else
+    echo
+    echo "Removing files..."
+    for f in "${matches[@]}"; do
+      rm -f -- "$f" && echo "  removed $f"
+    done
+  fi
+fi
+
+if [[ $KILL_FFPLAY -eq 1 ]]; then
+  echo
+  echo "ffplay processes (if any):"
+  ps aux | grep ffplay | grep -v grep || true
+  echo
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Dry-run mode: no processes will be killed. Rerun without --dry-run (or with --force/-y) to kill ffplay."
+  else
+    if [[ $FORCE -eq 1 ]]; then
+      echo "Killing ffplay processes..."
+      if command -v pkill >/dev/null 2>&1; then
+        pkill ffplay && echo "pkill sent to ffplay processes" || true
+      else
+        pids=($(ps aux | awk '/[f]fplay/ {print $2}'))
+        if [[ ${#pids[@]} -gt 0 ]]; then
+          for pid in "${pids[@]}"; do
+            kill "$pid" && echo "killed $pid" || true
+          done
+        fi
+      fi
+    else
+      read -rp "Kill all ffplay processes? [y/N]: " ans
+      ans="${ans:-N}"
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        echo "Killing ffplay processes..."
+        if command -v pkill >/dev/null 2>&1; then
+          pkill ffplay && echo "pkill sent to ffplay processes" || true
+        else
+          pids=($(ps aux | awk '/[f]fplay/ {print $2}'))
+          if [[ ${#pids[@]} -gt 0 ]]; then
+            for pid in "${pids[@]}"; do
+              kill "$pid" && echo "killed $pid" || true
+            done
+          fi
+        fi
+      else
+        echo "Skipping killing ffplay processes."
+      fi
+    fi
+  fi
+fi
+
+exit 0

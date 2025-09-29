@@ -1,0 +1,659 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# if a python implementation exists, prefer it — hands off execution to Python.
+if command -v python3 >/dev/null 2>&1 && [ -f "$(dirname "$0")/run.py" ]; then
+  exec python3 "$(dirname "$0")/run.py" "$@"
+fi
+
+VERSION="0.4"
+
+# directory of this script (robust for bash, zsh, and when set -u is enabled)
+# prefer BASH_SOURCE when available, fallback to $0
+if [ -n "${BASH_SOURCE+x}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+fi
+
+# helper: print_section [message]
+# prints a single blank line, optionally followed by a message.
+print_section() {
+  if [[ $# -eq 0 ]]; then
+    echo
+  else
+    echo
+    printf "%s\n" "$*"
+  fi
+}
+
+echo "YouTube Transcoder | v${VERSION}"
+echo "Press Cmd + . at any time to quit."
+
+# run quick startup checks for user information
+startup_checks() {
+  # require the Python helper; don't fall back to shell checks anymore
+  if command -v python3 >/dev/null 2>&1 && [[ -f "${SCRIPT_DIR}/scripts/startup_checks.py" ]]; then
+    python3 "${SCRIPT_DIR}/scripts/startup_checks.py"
+    return 0
+  fi
+  printf "ERROR: startup_checks requires Python3 and scripts/startup_checks.py\n" >&2
+  printf "Please install Python3 or restore the helper script.\n" >&2
+  return 1
+}
+
+# default CLI variables (safe defaults to avoid unbound variable errors)
+IN=""
+OUT=""
+RESOLUTION=""
+TUNE=""
+NONINTERACTIVE=0
+SHOW_FRAME=0
+LIST_RES=0
+LIST_TUNES=0
+FORCE_INSTALL=0
+
+usage() {
+  cat <<USAGE
+Usage: $0 [options]
+  -i, --input FILE        Input file
+  -o, --output FILE       Output file
+  -r, --resolution VAL    Resolution index, name, or WxH
+  -t, --tune NAME         Tune option
+  --show-frame            Enable live preview
+  -y, --yes               Non-interactive: accept defaults
+  --list-res              List available resolutions and exit
+  --list-tunes            List available tune options and exit
+  -h, --help              Show this help
+USAGE
+}
+
+# simple CLI parser
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    -i|--input) IN="$2"; shift 2 ;;
+    -o|--output) OUT="$2"; shift 2 ;;
+    -r|--resolution) RESOLUTION="$2"; shift 2 ;;
+    -t|--tune) TUNE="$2"; shift 2 ;;
+    --show-frame) SHOW_FRAME=1; shift ;;
+    -y|--yes) NONINTERACTIVE=1; shift ;;
+    --list-res) LIST_RES=1; shift ;;
+    --list-tunes) LIST_TUNES=1; shift ;;
+  --force-install) FORCE_INSTALL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+  *) print_section "Unknown option: $1"; usage; exit 2 ;;
+  esac
+done
+
+# run startup checks now that CLI flags have been parsed
+startup_checks
+
+# final cleanup before exiting the script
+# idempotent final cleanup: run once even if called directly and via EXIT trap.
+FINAL_CLEANUP_DONE=0
+final_cleanup() {
+  if [[ "${FINAL_CLEANUP_DONE:-0}" -ne 0 ]]; then
+    return 0
+  fi
+  FINAL_CLEANUP_DONE=1
+  # ensure preview-specific resources are torn down
+  if declare -f preview_cleanup >/dev/null 2>&1; then
+    preview_cleanup || true
+  fi
+  print_section "Bugs/Feedback: hi@evy.li"
+}
+# ensure final_cleanup runs on any script exit (normal or error)
+trap 'final_cleanup' EXIT
+preview_cleanup() {
+  # kill preview player and remove fifo/tmpdir without prompting
+  if [[ -n "${PLAYER_PID:-}" ]]; then
+    kill "${PLAYER_PID}" >/dev/null 2>&1 || true
+    wait "${PLAYER_PID}" 2>/dev/null || true
+    PLAYER_PID=""
+  fi
+  if [[ -n "${PREVIEW_FIFO:-}" ]]; then
+    if [[ -p "${PREVIEW_FIFO}" ]]; then
+      rm -f "${PREVIEW_FIFO}" || true
+    fi
+    PREVIEW_FIFO=""
+  fi
+  if [[ -n "${PREVIEW_TMPDIR:-}" && -d "${PREVIEW_TMPDIR}" ]]; then
+    rm -rf "${PREVIEW_TMPDIR}" || true
+    PREVIEW_TMPDIR=""
+  fi
+# close preview cleanup
+}
+
+# ensure required media tools are installed. on macOS, prefer Homebrew.
+ensure_tools_installed() {
+  local missing=()
+  for cmd in ffmpeg ffprobe ffplay; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+
+  # if nothing missing and user didn't request force install, nothing to do
+  if (( ${#missing[@]} == 0 )) && [[ "${FORCE_INSTALL:-0}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # force reinstall path: update brew and reinstall ffmpeg (provides ffprobe/ffplay)
+    if [[ "${FORCE_INSTALL:-0}" -eq 1 ]]; then
+  print_section "Forcing Homebrew reinstall of ffmpeg"
+      if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+        read -rp "Proceed with brew update && brew reinstall ffmpeg? [Y/N]: " ans
+        ans="${ans:-Y}"
+        if [[ ! "$ans" =~ ^[Yy] ]]; then
+  print_section "Aborting reinstall."
+          exit 1
+        fi
+      fi
+      if ! command -v brew >/dev/null 2>&1; then
+  print_section "Homebrew not found. Please install Homebrew: https://brew.sh"
+        exit 1
+      fi
+      brew update || { print_section "brew update failed"; exit 1; }
+      if brew list ffmpeg >/dev/null 2>&1; then
+        brew reinstall ffmpeg || { print_section "brew reinstall failed"; exit 1; }
+      else
+        brew install ffmpeg || { print_section "brew install failed"; exit 1; }
+      fi
+      return 0
+    fi
+
+    # install missing tools if any
+    if (( ${#missing[@]} )); then
+      if ! command -v brew >/dev/null 2>&1; then
+        print_section "Homebrew not found. Please install Homebrew: https://brew.sh"
+        print_section "Missing: ${missing[*]}"
+        exit 1
+      fi
+      if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+        print_section
+        read -rp "Install missing packages via Homebrew? (${missing[*]}) [Y/n]: " ans
+        ans="${ans:-Y}"
+        if [[ ! "$ans" =~ ^[Yy] ]]; then
+          print_section "Aborting; missing tools: ${missing[*]}"
+          exit 1
+        fi
+      fi
+  print_section "Installing missing packages via Homebrew: ${missing[*]}"
+      brew install ffmpeg || { print_section "brew install failed"; exit 1; }
+    fi
+  else
+  print_section "Missing tools: ${missing[*]}. Automatic install only supported on macOS with Homebrew."
+    exit 1
+  fi
+}
+
+# if user asked to force reinstall, run the tool installer now (function is defined above)
+if [[ "${FORCE_INSTALL:-0}" -eq 1 ]]; then
+  ensure_tools_installed
+fi
+
+# check python availability for inline python snippets used for computations
+if ! command -v python3 >/dev/null 2>&1; then
+  print_section "Python3 not found."
+  final_cleanup
+  exit 1
+fi
+
+RES_NAMES=(
+  "8K [yt]" "DCI 4K Flat" "DCI 4K Scope" "DCI 2K Flat" "DCI 2K Scope"
+  "UHD [yt]" "QHD [yt]" "FHD [yt]" "HD [yt]" "PAL" "NTSC"
+)
+RES_VALUES=(
+  "7680:4320" "4096:2160" "4096:1716" "1998:1080" "2048:858"
+  "3840:2160" "2560:1440" "1920:1080" "1280:720" "720:576" "720:480"
+)
+
+TUNE_OPTIONS=("film" "grain" "animation")
+TUNE_DESCRIPTIONS=(
+  "film (optimal for low/no grain film)"
+  "grain (optimal for grainy film)"
+  "animation (optimal for animated content)"
+)
+
+if [[ "$LIST_RES" -eq 1 ]]; then
+  print_section "Available resolutions:";
+  for i in "${!RES_NAMES[@]}"; do
+    idx=$((i+1))
+    echo "$idx) ${RES_NAMES[i]} -> ${RES_VALUES[i]}"
+  done
+  exit 0
+fi
+
+if [[ "$LIST_TUNES" -eq 1 ]]; then
+  print_section "Tune options:";
+  for i in "${!TUNE_OPTIONS[@]}"; do
+    idx=$((i+1))
+    echo "$idx) ${TUNE_OPTIONS[i]} - ${TUNE_DESCRIPTIONS[i]}"
+  done
+  exit 0
+fi
+
+# if input wasn't provided via CLI, prompt the user (interactive mode)
+if [[ -z "$IN" ]]; then
+  while true; do
+    print_section
+    read -rp "Enter input file name (hit Enter to open a GUI file picker on macOS): " IN
+    # if user pressed Enter on macOS, open GUI picker and capture POSIX path
+    if [[ -z "$IN" && "$(uname)" == "Darwin" ]]; then
+      FILE_PATH=$(osascript -e 'try' -e 'set f to POSIX path of (choose file with prompt "Select input file")' -e 'return f' -e 'on error' -e 'return ""' -e 'end try') || FILE_PATH=""
+      if [[ -n "$FILE_PATH" ]]; then
+        IN="$FILE_PATH"
+      fi
+    fi
+    # if the file exists as given, accept it
+    if [[ -f "$IN" ]]; then
+      break
+    fi
+    # try script directory if a plain filename was provided and not found in cwd
+    if [[ -n "$IN" && ! "$IN" =~ ^/ && -f "$(dirname "$0")/$IN" ]]; then
+      IN="$(cd "$(dirname "$0")" >/dev/null 2>&1 && printf "%s/%s" "$(pwd)" "$IN")"
+      break
+    fi
+    print_section "File '$IN' not found in current folder. Please try again."
+  done
+else
+  if [[ ! -f "$IN" ]]; then
+    print_section "Input file '$IN' not found."; final_cleanup; exit 2
+  fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+DEFAULT_OUT="${IN%.*}_ytt.mp4"
+if [[ -z "$OUT" ]]; then
+  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+    OUT="$DEFAULT_OUT"
+  else
+  print_section
+  read -rp "Enter output file name (or hit Enter to open a Save dialog on macOS, leave empty for default): " OUT
+    # if empty and on macOS, open a Save dialog to choose filename
+    if [[ -z "$OUT" && "$(uname)" == "Darwin" ]]; then
+      # open Save dialog defaulting to the user's home directory and suggest only the basename
+      DEFAULT_BASENAME="$(basename "${DEFAULT_OUT}")"
+      FILE_SAVE=$(osascript -e 'try' -e 'set f to POSIX path of (choose file name with prompt "Select output file" default name "'"${DEFAULT_BASENAME}"'" default location (POSIX file "'"${HOME}"'"))' -e 'return f' -e 'on error' -e 'return ""' -e 'end try') || FILE_SAVE=""
+      if [[ -n "$FILE_SAVE" ]]; then
+        OUT="$FILE_SAVE"
+      fi
+    fi
+    OUT="${OUT:-$DEFAULT_OUT}"
+  fi
+fi
+
+# preview support. show the current frame in sync with the transcode.
+SHOW_FRAME=${SHOW_FRAME:-0}
+PREVIEW_FIFO=""
+PLAYER_PID=""
+  if [[ "$SHOW_FRAME" -eq 1 ]]; then
+  # ensure the required tools are installed (attempt Homebrew install on macOS).
+  ensure_tools_installed
+    # prefer system ffplay on PATH (Homebrew installs it).
+  FFPLAY_CMD="$(command -v ffplay || true)"
+  if [[ -z "${FFPLAY_CMD}" ]]; then
+    print_section "--show-frame requested but ffplay not found; disabling preview."
+    SHOW_FRAME=0
+  fi
+fi
+
+# resolution selection: support CLI value as index, name, or W:H
+if [[ -n "$RESOLUTION" ]]; then
+  # numeric index
+  if [[ "$RESOLUTION" =~ ^[0-9]+$ ]] && (( RESOLUTION >= 1 && RESOLUTION <= ${#RES_VALUES[@]} )); then
+    idx=$((RESOLUTION-1))
+    RES_NAME="${RES_NAMES[idx]}"
+    RESOLUTION="${RES_VALUES[idx]}"
+  else
+    # exact W:H match
+    for i in "${!RES_VALUES[@]}"; do
+      if [[ "${RES_VALUES[i]}" == "$RESOLUTION" ]]; then
+        RES_NAME="${RES_NAMES[i]}"; break
+      fi
+    done
+    # name match
+    if [[ -z "${RES_NAME:-}" ]]; then
+      for i in "${!RES_NAMES[@]}"; do
+        if [[ "${RES_NAMES[i]}" == *"$RESOLUTION"* ]]; then
+          RES_NAME="${RES_NAMES[i]}"; RESOLUTION="${RES_VALUES[i]}"; break
+        fi
+      done
+    fi
+      if [[ -z "${RES_NAME:-}" ]]; then
+      # run startup checks after parsing CLI so simulation flags take effect
+      startup_checks
+      print_section "Unrecognized resolution: $RESOLUTION"; final_cleanup; exit 2
+    fi
+  fi
+else
+  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+    # non-interactive: probe input resolution and auto-match to supported targets
+    IN_WIDTH=""; IN_HEIGHT=""
+    while IFS= read -r line; do
+      if [[ -z "$IN_WIDTH" ]]; then
+        IN_WIDTH="$line"
+      else
+        IN_HEIGHT="$line"
+        break
+      fi
+    done < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=nk=1:nw=1 "$IN" 2>/dev/null || true)
+    if [[ -n "$IN_WIDTH" && -n "$IN_HEIGHT" ]]; then
+      src="${IN_WIDTH}:${IN_HEIGHT}"
+      matched=0
+      for i in "${!RES_VALUES[@]}"; do
+        if [[ "${RES_VALUES[i]}" == "$src" ]]; then
+          RESOLUTION="$src"
+          RES_NAME="${RES_NAMES[i]}"
+          matched=1
+          break
+        fi
+      done
+      if [[ $matched -eq 1 ]]; then
+        print_section "Non-interactive: detected source resolution $src matches supported resolution: $RES_NAME"
+      else
+        print_section "Non-interactive: detected source resolution $src does not match any supported target resolutions. Aborting." >&2
+        final_cleanup
+        exit 2
+      fi
+    else
+      print_section "Non-interactive: could not determine input resolution. Aborting." >&2
+      final_cleanup
+      exit 2
+    fi
+  else
+  print_section "Available resolutions (YouTube native resolutions marked with [yt]):"
+    PS3="Select a resolution (default 1): "
+    select RES_NAME in "${RES_NAMES[@]}"; do
+      if [[ -n "$RES_NAME" ]]; then
+        RESOLUTION="${RES_VALUES[$((REPLY-1))]}"
+        print_section "Selected: $RES_NAME (${RESOLUTION})"
+        break
+      else
+        print_section "Invalid selection."
+      fi
+    done
+  fi
+fi
+
+# tune selection
+if [[ -n "$TUNE" ]]; then
+  found=0
+  for t in "${TUNE_OPTIONS[@]}"; do
+    if [[ "$t" == "$TUNE" ]]; then found=1; break; fi
+  done
+    if [[ $found -ne 1 ]]; then
+    print_section "Invalid tune option: $TUNE"; final_cleanup; exit 2
+  fi
+else
+  print_section "Available tune options:"
+  for i in "${!TUNE_OPTIONS[@]}"; do
+    echo "$((i + 1)). ${TUNE_DESCRIPTIONS[i]}"
+  done
+  while true; do
+    if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+      TUNE="${TUNE_OPTIONS[0]}"; print_section "Selected tune option: $TUNE"; break
+    fi
+    read -rp "Select a tune option [1-${#TUNE_OPTIONS[@]}] (default 1): " TUNE_IDX
+    TUNE_IDX="${TUNE_IDX:-1}"
+    if [[ "$TUNE_IDX" =~ ^[1-9][0-9]*$ ]] && (( TUNE_IDX >= 1 && TUNE_IDX <= ${#TUNE_OPTIONS[@]} )); then
+      TUNE="${TUNE_OPTIONS[$((TUNE_IDX-1))]}"
+      print_section "Selected tune option: $TUNE"
+      break
+    else
+      print_section "Invalid selection."
+    fi
+  done
+fi
+
+# --- encoder quality knobs ---
+CRF=16; PRESET=slow; BF=2; REF=4; PIX_FMT=yuv420p; AUDIO_BITRATE=384k; AUDIO_RATE=48000
+
+OUT_WIDTH="${RESOLUTION%%:*}"
+OUT_HEIGHT="${RESOLUTION##*:}"
+
+# Probe video info (FPS, GOP, TOTAL_FRAMES, IN_WIDTH, IN_HEIGHT, PREVIEW_W, PREVIEW_H)
+if command -v python3 >/dev/null 2>&1 && [[ -f "${SCRIPT_DIR}/scripts/video_info.py" ]]; then
+  # eval key=value lines emitted by the helper (values are single-quoted)
+  eval "$(python3 "${SCRIPT_DIR}/scripts/video_info.py" "$IN" "$OUT_WIDTH" "$OUT_HEIGHT" )"
+else
+  # fallback: minimal defaults
+  FPS=24.0
+  GOP=12
+  TOTAL_FRAMES=""
+  IN_WIDTH=""
+  IN_HEIGHT=""
+  PREVIEW_W=640
+  PREVIEW_H=360
+fi
+
+# if running fully non-interactive and no RESOLUTION provided,
+# try to auto-match the input resolution to one of the supported targets.
+if [[ "$NONINTERACTIVE" -eq 1 && -z "${RESOLUTION}" ]]; then
+  if [[ -n "$IN_WIDTH" && -n "$IN_HEIGHT" ]]; then
+    src="${IN_WIDTH}:${IN_HEIGHT}"
+    matched=0
+    for i in "${!RES_VALUES[@]}"; do
+      if [[ "${RES_VALUES[i]}" == "$src" ]]; then
+        RESOLUTION="$src"
+        RES_NAME="${RES_NAMES[i]}"
+        matched=1
+        break
+      fi
+    done
+    if [[ $matched -eq 1 ]]; then
+      print_section "Non-interactive: detected source resolution $src matches supported resolution: $RES_NAME"
+    else
+      print_section "Non-interactive: detected source resolution $src does not match any supported target resolutions. Aborting." >&2
+      cleanup_venv
+      exit 2
+    fi
+  else
+    print_section "Non-interactive: could not determine input resolution. Aborting." >&2
+    cleanup_venv
+    exit 2
+  fi
+fi
+
+# only warn if either dimension is strictly less than the target
+if [[ -z "$IN_WIDTH" || -z "$IN_HEIGHT" ]]; then
+  print_section "Could not determine input resolution. Skipping upscaling warning."
+elif (( IN_WIDTH < OUT_WIDTH || IN_HEIGHT < OUT_HEIGHT )); then
+  print_section "Warning: Input video (${IN_WIDTH}x${IN_HEIGHT}) is smaller than target resolution (${OUT_WIDTH}x${OUT_HEIGHT})."
+  print_section "Upscaling may reduce quality."
+  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+    print_section "Non-interactive mode: proceeding with upscaling."
+  else
+    print_section
+    read -rp "Proceed? (Y/N): " UPSCALE_CONFIRM
+    if [[ ! "$UPSCALE_CONFIRM" =~ ^[Yy]$ ]]; then
+      print_section "Aborted."
+      final_cleanup
+      exit 1
+    fi
+  fi
+elif (( IN_WIDTH == OUT_WIDTH && IN_HEIGHT == OUT_HEIGHT )); then
+  print_section "Input resolution matches the target resolution (${OUT_WIDTH}x${OUT_HEIGHT})."
+fi
+
+print_section "Detected FPS: ${FPS} -> using GOP (keyint) = ${GOP}"
+echo "Input: $IN"
+echo "Output: $OUT"
+echo "Resolution: ${RESOLUTION}"
+echo "Preset: ${PRESET}, CRF: ${CRF}, Tune: ${TUNE}"
+# combine preview selection with final confirmation in interactive mode.
+# offer: [P]review / [N]o preview / [C]ancel
+SKIP_FINAL_CONFIRM=0
+if [[ "${NONINTERACTIVE}" -eq 0 && "${SHOW_FRAME:-0}" -eq 0 ]]; then
+  print_section
+  read -rp "Proceed with or without preview? ([P]review/[N]o preview/[C]ancel): " PREVIEW_CHOICE
+  case "$PREVIEW_CHOICE" in
+    [Pp]* )
+      SHOW_FRAME=1
+      if ! command -v ffplay >/dev/null 2>&1; then
+        print_section "ffplay not found in PATH; preview disabled."
+        SHOW_FRAME=0
+      fi
+      SKIP_FINAL_CONFIRM=1
+      ;;
+    [Nn]* )
+      SHOW_FRAME=0
+      SKIP_FINAL_CONFIRM=1
+      ;;
+    [Cc]* )
+      print_section "Aborted."
+      final_cleanup
+      exit 1
+      ;;
+    * )
+      print_section "Invalid choice. Aborted."
+      final_cleanup
+      exit 1
+      ;;
+  esac
+fi
+
+if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+  print_section "Non-interactive mode; proceeding without confirmation."
+else
+  if [[ "$SKIP_FINAL_CONFIRM" -eq 1 ]]; then
+    if [[ "${SHOW_FRAME:-0}" -eq 1 ]]; then
+      print_section "Proceeding with preview enabled."
+    else
+      print_section "Proceeding without preview."
+    fi
+  else
+    read -rp "Proceed? (Y/N): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+      print_section "Aborted."
+      final_cleanup
+      exit 1
+    fi
+  fi
+fi
+# if preview requested, ensure ffplay exists on PATH (Homebrew) and then create FIFO and launch player
+if [[ "$SHOW_FRAME" -eq 1 ]]; then
+  # make sure FFPLAY_CMD is defined (covers cases where SHOW_FRAME is toggled interactively.
+  # after initial checks). FFPLAY_CMD will be set to the system ffplay on PATH.
+  FFPLAY_CMD="${FFPLAY_CMD:-$(command -v ffplay || true)}"
+  if [[ -z "${FFPLAY_CMD}" || ! -x "${FFPLAY_CMD}" ]]; then
+    print_section "--show-frame requested but ffplay not found on PATH; disabling preview."
+    SHOW_FRAME=0
+  fi
+fi
+
+if [[ "$SHOW_FRAME" -eq 1 ]]; then
+  PREVIEW_FIFO=$(mktemp -u /tmp/ytt_preview_fifo.XXXX)
+  mkfifo "$PREVIEW_FIFO"
+  # launch player reading the MJPEG FIFO. Use low-latency flags where available.
+  # determine preview window size: cap max dimension to 1080 while preserving aspect ratio.
+  # dse the target output resolution (OUT_WIDTH x OUT_HEIGHT) as the preview source size.
+  # PREVIEW_W and PREVIEW_H are provided by the video_info helper
+  if [[ -z "$PREVIEW_W" || -z "$PREVIEW_H" || "$PREVIEW_W" -le 0 || "$PREVIEW_H" -le 0 ]]; then
+    # fallback to a modest size if computation fails
+    PREVIEW_W=640; PREVIEW_H=360
+  fi
+
+  # ffplay: specify mjpeg format, size, and minimal buffering
+  "${FFPLAY_CMD}" -x ${PREVIEW_W} -y ${PREVIEW_H} -loglevel quiet -fflags nobuffer -flags low_delay -framedrop -autoexit -f mjpeg -i "$PREVIEW_FIFO" >/dev/null 2>&1 &
+  PLAYER_PID=$!
+
+  # give the player a moment to create its window and then try to focus it on macOS
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # short sleep to allow window to appear
+    # give a slightly longer delay to allow window manager to register the new window
+    sleep 0.4
+    # prefer focusing by PID (more reliable when multiple ffplay instances exist).
+    # if that fails, fallback to focusing by process name.
+    osascript >/dev/null 2>&1 <<AS
+try
+  tell application "System Events"
+    -- try to find the process by unix id
+    set thePid to ${PLAYER_PID}
+    set matched to false
+    repeat with p in (every process)
+      try
+        if unix id of p is thePid then
+          set frontmost of p to true
+          set matched to true
+          exit repeat
+        end if
+      end try
+    end repeat
+    if not matched then
+      -- fallback to name-based focus
+      set procList to (name of every process)
+      if procList contains "ffplay" then
+        set frontmost of (first process whose name is "ffplay") to true
+      end if
+    end if
+  end tell
+end try
+AS
+  fi
+  print_section "Preview player started (PID=${PLAYER_PID}), preview FIFO: $PREVIEW_FIFO"
+fi
+
+# build ffmpeg filter and command. If preview enabled, split filtered frames into two
+# outputs: [enc] (main) and [prev] (preview MJPEG written to FIFO).
+if [[ "$SHOW_FRAME" -eq 1 ]]; then
+  # build a filter that applies the main scale/pad/format, then splits to [enc] and [prev],
+  # then scales [prev] to PREVIEW_WxPREVIEW_H before sending to the MJPEG FIFO.
+  FILTER_COMPLEX="scale=${RESOLUTION}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${RESOLUTION}:(ow-iw)/2:(oh-ih)/2:color=black,format=${PIX_FMT},split=2[enc][prev];[prev]scale=${PREVIEW_W}:${PREVIEW_H}:flags=lanczos[prevout]"
+  # run ffmpeg with structured progress on fd3; use -nostats and -progress pipe:3
+  export TOTAL_FRAMES="${TOTAL_FRAMES:-}"
+  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:3 -y -i "$IN" -filter_complex "$FILTER_COMPLEX" \
+    -map "[enc]" -map 0:a? \
+      -c:v libx264 \
+        -preset ${PRESET} \
+        -crf ${CRF} \
+        -tune ${TUNE} \
+        -profile:v high \
+        -pix_fmt ${PIX_FMT} \
+        -bf ${BF} \
+        -refs ${REF} \
+        -g ${GOP} \
+        -sc_threshold 0 \
+        -x264-params "open_gop=0:cabac=1:weightp=1" \
+      -c:a aac -b:a ${AUDIO_BITRATE} -ar ${AUDIO_RATE} -ac 2 \
+      -movflags +faststart -f mp4 "$OUT" \
+    -map "[prevout]" -c:v mjpeg -q:v 5 -f mjpeg "$PREVIEW_FIFO" \
+  3> >(python3 "${SCRIPT_DIR}/scripts/ffmpeg_progress.py")
+else
+  # no-preview ffmpeg: structured progress on fd3
+  export TOTAL_FRAMES="${TOTAL_FRAMES:-}"
+  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:3 -y -i "$IN" \
+    -map 0:v -map 0:a? \
+    -vf "scale=${RESOLUTION}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${RESOLUTION}:(ow-iw)/2:(oh-ih)/2:color=black,format=${PIX_FMT}" \
+    -c:v libx264 \
+      -preset ${PRESET} \
+      -crf ${CRF} \
+      -tune ${TUNE} \
+      -profile:v high \
+      -pix_fmt ${PIX_FMT} \
+      -bf ${BF} \
+      -refs ${REF} \
+      -g ${GOP} \
+      -sc_threshold 0 \
+      -x264-params "open_gop=0:cabac=1:weightp=1" \
+    -c:a aac -b:a ${AUDIO_BITRATE} -ar ${AUDIO_RATE} -ac 2 \
+    -movflags +faststart \
+  -f mp4 "$OUT" 3> >(python3 "${SCRIPT_DIR}/scripts/ffmpeg_progress.py")
+fi
+
+# cleanup preview FIFO and player if used
+if [[ -n "${PLAYER_PID:-}" ]]; then
+  # give the player a moment to exit cleanly
+  sleep 0.2
+  kill "${PLAYER_PID}" >/dev/null 2>&1 || true
+fi
+if [[ -n "${PREVIEW_FIFO}" && -p "${PREVIEW_FIFO}" ]]; then
+  rm -f "${PREVIEW_FIFO}"
+fi
+
+print_section "Transcoding completed successfully!"
+print_section "Output file: $OUT"
+
+final_cleanup
