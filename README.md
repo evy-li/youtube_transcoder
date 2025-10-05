@@ -52,8 +52,6 @@ ls -la
 
 ## Usage
 
-Copy or move the file you wish to transcode into the folder.
-
 Double click the 'run' executable.
 
 Or open a terminal at the folder you cloned to. You can secondary click (control-click) on the folder and select "New Terminal at Folder".
